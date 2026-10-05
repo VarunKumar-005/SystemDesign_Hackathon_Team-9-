@@ -1,0 +1,76 @@
+# ==========================================
+# SaleStorm Monorepo Root .gitignore
+# Covers Java/Spring Boot Backend & Next.js Frontend
+# ==========================================
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDEs and Editors
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Logs and runtime files
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment and Secrets
+.env
+.env*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ------------------------------------------
+# Backend: Java / Maven / Spring Boot
+# ------------------------------------------
+backend/target/
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# ------------------------------------------
+# Frontend: Node / Next.js / TypeScript
+# ------------------------------------------
+frontend/node_modules/
+**/node_modules/
+frontend/.next/
+**/.next/
+frontend/out/
+**/out/
+frontend/build/
+**/build/
+.turbo/
+.vercel/
+
+# TypeScript / Turbopack Cache
+*.tsbuildinfo
+next-env.d.ts.bak
+
+# Testing & Coverage
+coverage/
+.nyc_output/
