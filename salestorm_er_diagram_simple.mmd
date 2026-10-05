@@ -1,0 +1,165 @@
+---
+title: SALESTORM Flash Sale - Simplified ER Diagram
+---
+erDiagram
+    CUSTOMER ||--o{ RESERVATION : "holds"
+    CUSTOMER ||--o{ ORDERS : "places"
+    PRODUCT ||--o{ SALE_ITEM : "offered in"
+    PRODUCT ||--|| INVENTORY : "stocked as"
+    SALE_ITEM ||--o{ RESERVATION : "reserved under"
+    INVENTORY ||--o{ RESERVATION : "reserves from"
+    INVENTORY ||--o{ INVENTORY_LEDGER : "audited by"
+    RESERVATION |o--o{ INVENTORY_LEDGER : "recorded in"
+    RESERVATION ||--o| ORDERS : "converted to"
+    ORDERS ||--o{ PAYMENT : "paid by"
+
+    CUSTOMER {
+        uuid customer_id PK
+        string email UK
+        string phone UK
+        string full_name
+        enum status "ACTIVE, BLOCKED"
+        timestamp created_at
+    }
+
+    PRODUCT {
+        uuid product_id PK
+        string sku UK
+        string name
+        string description
+        bigint base_price_minor "paise"
+        string currency_code
+        enum status "DRAFT, ACTIVE, ARCHIVED"
+    }
+
+    SALE_ITEM {
+        uuid sale_item_id PK
+        uuid product_id FK
+        bigint sale_price_minor "flash price"
+        int per_customer_limit
+        timestamp starts_at
+        timestamp ends_at
+        enum status "SCHEDULED, LIVE, ENDED"
+    }
+
+    INVENTORY {
+        uuid inventory_id PK
+        uuid product_id FK, UK
+        int total_quantity "available + reserved + sold"
+        int available_quantity "never below 0"
+        int reserved_quantity "never below 0"
+        int sold_quantity "never below 0"
+        bigint version "bumped on every change"
+        timestamp updated_at
+    }
+
+    RESERVATION {
+        uuid reservation_id PK
+        uuid inventory_id FK
+        uuid customer_id FK
+        uuid sale_item_id FK
+        int quantity "above 0"
+        enum status "RESERVED, SOLD, RELEASED"
+        string release_reason "PAYMENT_FAILED, TIMEOUT, CANCELLED"
+        string idempotency_key UK "duplicate click guard"
+        timestamp reserved_at
+        timestamp expires_at "TTL, sweeper releases"
+        timestamp released_at
+    }
+
+    INVENTORY_LEDGER {
+        bigint ledger_id PK
+        uuid inventory_id FK
+        uuid reservation_id FK "nullable"
+        enum movement_type "RESERVE, RELEASE, SELL, RESTOCK"
+        int delta_available
+        int delta_reserved
+        int delta_sold
+        timestamp created_at
+    }
+
+    ORDERS {
+        uuid order_id PK
+        uuid customer_id FK
+        uuid reservation_id FK, UK "one reservation, one order"
+        uuid product_id FK
+        int quantity
+        bigint unit_price_minor "price snapshot"
+        bigint total_minor
+        enum status "PENDING, CONFIRMED, CANCELLED"
+        string cancel_reason
+        string idempotency_key UK "duplicate checkout guard"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PAYMENT {
+        uuid payment_id PK
+        uuid order_id FK
+        enum method "CARD, UPI, NETBANKING, WALLET"
+        bigint amount_minor
+        enum status "PENDING, SUCCEEDED, FAILED, TIMED_OUT"
+        string idempotency_key UK "duplicate charge guard"
+        string transaction_ref UK "our reference sent to gateway"
+        string gateway_txn_id UK "nullable"
+        string failure_code
+        timestamp initiated_at
+        timestamp completed_at
+    }
+
+    %% [HOW OVERSELLING IS PREVENTED]
+    %% One atomic conditional UPDATE on the product's INVENTORY row:
+    %%   UPDATE inventory
+    %%      SET available_quantity = available_quantity - :q,
+    %%          reserved_quantity  = reserved_quantity  + :q,
+    %%          version = version + 1, updated_at = now()
+    %%    WHERE product_id = :p AND available_quantity >= :q
+    %% 1 row updated = reserved. 0 rows = out of stock, nothing else is written.
+    %% The row lock lasts only for this short transaction, so buyers queue for milliseconds.
+    %% CHECK constraints are the last line of defence against negative counters.
+
+    %% [FLOW]
+    %% T1 Reserve (one transaction): check sale window and per_customer_limit, run the UPDATE above,
+    %%    INSERT reservation (RESERVED, expires_at = now + TTL), INSERT ledger (RESERVE).
+    %%    A repeat idempotency_key fails on UNIQUE and rolls back, so a double click takes no second unit.
+    %% T2 Order: INSERT order (PENDING) linked to the reservation, with a price snapshot.
+    %% T3 Pay: INSERT payment (PENDING, transaction_ref) BEFORE calling the gateway.
+    %%    A gateway timeout leaves TIMED_OUT; resolve by querying the gateway with transaction_ref,
+    %%    so a retry cannot charge twice.
+    %% T4a Success: payment SUCCEEDED, order CONFIRMED, reservation SOLD,
+    %%    reserved - q, sold + q, ledger (SELL).
+    %% T4b Failure or TTL expiry: reservation RELEASED, reserved - q, available + q, ledger (RELEASE),
+    %%    order CANCELLED. Release is guarded by status = RESERVED, so it never touches SOLD and is safe to retry.
+    %% Late payment: success arrives after the reservation was RELEASED -> cancel the order and refund the customer.
+
+    %% [CONSTRAINTS]
+    %% INVENTORY: UNIQUE (product_id); CHECK (available >= 0 AND reserved >= 0 AND sold >= 0);
+    %%    CHECK (available + reserved + sold = total_quantity)
+    %% RESERVATION: UNIQUE (idempotency_key); CHECK (quantity > 0);
+    %%    partial UNIQUE (customer_id, sale_item_id) WHERE status IN (RESERVED, SOLD) when per_customer_limit = 1
+    %% ORDERS: UNIQUE (reservation_id), UNIQUE (idempotency_key)
+    %% PAYMENT: UNIQUE (idempotency_key), UNIQUE (transaction_ref), UNIQUE (gateway_txn_id) where not null;
+    %%    partial UNIQUE (order_id) WHERE status = 'SUCCEEDED' so an order has one successful payment
+    %% Every FK uses ON DELETE RESTRICT. Money is stored as integer minor units (paise). Timestamps are UTC.
+
+    %% [INDEXES]
+    %% RESERVATION (status, expires_at) for the expiry sweeper
+    %% ORDERS (status, updated_at) to find orders stuck in PENDING
+    %% PAYMENT (order_id); PAYMENT (status, initiated_at) to reconcile PENDING and TIMED_OUT payments
+    %% INVENTORY_LEDGER (inventory_id, created_at)
+
+    %% [INVARIANTS] checked by a reconciliation job
+    %% I1 available + reserved + sold = total_quantity, and none is negative
+    %% I2 reserved_quantity = SUM(quantity) of RESERVED reservations
+    %% I3 sold_quantity = SUM(quantity) of SOLD reservations
+    %% I4 SUM of ledger deltas = current counters
+    %% I5 at most one SUCCEEDED payment per order
+
+    %% [SCENARIO CHECK] Product X, total 100, 10,000 Buy Now clicks, 95% payment success
+    %% step                               available  reserved  sold
+    %% start                                  100        0       0
+    %% 100 requests win the UPDATE              0      100       0   (9,900 get out-of-stock)
+    %% 95 payments succeed                      0        5      95
+    %% 5 payments fail, units released          5        0      95
+    %% 5 later requests reserve and pay         0        0     100
+    %% available + reserved + sold = 100 after every step, so sold can never exceed 100.
