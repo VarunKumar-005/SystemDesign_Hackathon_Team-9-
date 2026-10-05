@@ -1,0 +1,127 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "mainBkg": "#ffffff", "lineColor": "#333333", "textColor": "#111111", "edgeLabelBackground": "#ffffff", "primaryTextColor": "#111111", "fontFamily": "Arial, sans-serif"}}}%%
+flowchart LR
+
+%% ---------- Edge / entry ----------
+CUST(["Customers<br/>10,000 concurrent Buy Now<br/>up to 500k req/s at the edge"])
+CDN{{"CDN + WAF<br/>WHY: absorb reads, block bots,<br/>force HTTPS, per-IP limit<br/>THROTTLE / REJECT: 403, 429"}}
+LB{{"Load Balancer (multi-AZ)<br/>WHY: spread load over gateway<br/>instances, health checks"}}
+GW{{"API Gateway<br/>WHY: one secured entry point:<br/>JWT, per-user rate limit,<br/>Idempotency-Key required<br/>THROTTLE / REJECT: 401, 422, 429"}}
+
+%% ---------- Services ----------
+PROD[["Product Service<br/>WHY: catalogue and discovery,<br/>read-heavy, CDN + cache first"]]
+CART[["Cart Service<br/>WHY: per-user cart, holds<br/>no stock until checkout"]]
+SALE[["Sale / Promotion Service<br/>WHY: sale window, price rules,<br/>per-user limit, waiting room<br/>QUEUE: bounded FIFO admission"]]
+INV[["Inventory + Reservation Service<br/>WHY: sole owner of stock state<br/>CONTENTION POINT: atomic<br/>conditional UPDATE (see 03)"]]
+PAY[["Payment Service<br/>WHY: only caller of the provider:<br/>idempotent, behind a circuit breaker"]]
+CHK[["Checkout Service<br/>WHY: facade + saga orchestrator:<br/>price snapshot, start payment,<br/>order commands, timeouts"]]
+ORD[["Order Service<br/>WHY: order record + lifecycle<br/>state machine, event-driven"]]
+SHIP[["Shipment Service<br/>WHY: fulfilment, carrier adapter<br/>behind a circuit breaker"]]
+NOTIF[["Notification Service<br/>WHY: customer messages, async,<br/>never blocks a sale"]]
+
+%% ---------- Data stores ----------
+PRODDB[("Product DB<br/>PostgreSQL + read replicas")]
+SALEDB[("Sale DB<br/>PostgreSQL + read replicas")]
+CARTDB[("Cart Store<br/>Redis / NoSQL, TTL")]
+CHKDB[("Checkout DB<br/>PostgreSQL: saga state")]
+ORDDB[("Order DB<br/>PostgreSQL, partitioned,<br/>read replicas")]
+SHIPDB[("Shipment DB<br/>PostgreSQL")]
+PAYDB[("Payment DB<br/>PostgreSQL<br/>UNIQUE(idempotency_key)")]
+NOTIFLOG[("Notification Log<br/>NoSQL document store")]
+CACHE[("Distributed Cache - Redis<br/>WHY: shields the databases:<br/>product + sale cache, stock gate,<br/>idempotency keys, rate counters<br/>BOTTLENECK: hot stock key -<br/>SOLD_OUT flag pushed to gateway")]
+INVDB[("Inventory DB<br/>PostgreSQL, sharded by product,<br/>primary + sync standby<br/>TX BOUNDARY: reserve = 1 ACID txn<br/>BOTTLENECK: hot row")]
+
+%% ---------- Messaging / resilience ----------
+KAFKA{{"Message Broker - Kafka<br/>WHY: decouples services, buffers<br/>spikes, replays after outages<br/>key = reservation_id, acks=all<br/>outbox on producers"}}
+DLQ[("Dead-Letter Queues<br/>WHY: park messages that fail<br/>after N retries - alert, replay")]
+
+%% ---------- Observability ----------
+OTEL{{"Telemetry Collector - OpenTelemetry<br/>trace_id minted at the gateway,<br/>carried through checkout, payment,<br/>order"}}
+MON[("Monitoring<br/>Prometheus + Grafana<br/>+ Alertmanager")]
+LOGS[("Structured Logs<br/>JSON: trace_id, reservation_id,<br/>order_id")]
+TRACE[("Distributed Tracing<br/>Tempo / Jaeger")]
+
+%% ---------- External ----------
+PROVIDER["Payment Provider / Gateway<br/>BOTTLENECK: external latency<br/>and rate limits"]
+EXT["External Notification Systems"]
+DELIVERY["Delivery / Shipment Partner"]
+
+%% ---------- Notes ----------
+NOTE1["EVENT OWNERSHIP (topic: consumers)<br/>inventory.events: Notification<br/>checkout.commands: Order<br/>payment.events: Inventory,<br/>Checkout, Notification<br/>order.events: Inventory,<br/>Shipment, Notification<br/>shipment.events: Order, Notification"]
+NOTE2["DESIGN RULES - separation of duties<br/>1 service = 1 database, no shared tables<br/>sync calls only on the purchase path<br/>after payment everything is async,<br/>idempotent and replayable"]
+NOTE3["LEGEND<br/>solid: synchronous call<br/>dotted blue: asynchronous message<br/>thick red: failure / recovery<br/>green: contention point<br/>red box: likely bottleneck"]
+
+%% ================= SYNCHRONOUS (solid) : links 0-25 =================
+CUST -->|HTTPS| CDN
+CDN -->|dynamic calls| LB
+LB --> GW
+GW --> PROD
+GW --> CART
+GW -->|waiting room| SALE
+GW -->|POST /reservations| INV
+GW -->|POST /checkout| CHK
+GW -->|order tracking| ORD
+GW -->|delivery tracking| SHIP
+PROD --> PRODDB
+PROD -->|read-through| CACHE
+CART --> CARTDB
+SALE --> SALEDB
+SALE -->|config, queue| CACHE
+INV --> INVDB
+INV -->|stock gate, idempotency| CACHE
+CHK -->|hold for payment| INV
+CHK -->|initiate payment| PAY
+CHK --> CHKDB
+PAY --> PAYDB
+PAY -->|charge| PROVIDER
+ORD --> ORDDB
+SHIP --> SHIPDB
+SHIP -->|create shipment| DELIVERY
+NOTIF --> NOTIFLOG
+
+%% ================= ASYNCHRONOUS (dotted blue) : links 26-41 =================
+INV -.->|inventory.events| KAFKA
+PAY -.->|payment.events| KAFKA
+CHK <-.->|checkout.commands| KAFKA
+ORD <-.->|order.events| KAFKA
+SHIP <-.->|shipment.events| KAFKA
+KAFKA -.-> NOTIF
+NOTIF -.->|email / SMS / push| EXT
+PROVIDER -.->|webhook| PAY
+DELIVERY -.->|tracking webhook| SHIP
+PAY -.->|metrics, logs, traces| OTEL
+INV -.-> OTEL
+CHK -.-> OTEL
+ORD -.-> OTEL
+OTEL -.-> MON
+OTEL -.-> LOGS
+OTEL -.-> TRACE
+
+%% ================= FAILURE / RECOVERY (thick red) : links 42-44 =================
+KAFKA ==>|retries exhausted| DLQ
+DLQ ==>|backlog alert| MON
+PROVIDER ==>|reconcile| PAY
+
+%% ================= STYLES =================
+classDef entry fill:#7c3aed,stroke:#4c1d95,color:#fff,stroke-width:2px
+classDef customer fill:#1e293b,stroke:#0f172a,color:#fff
+classDef service fill:#0f9488,stroke:#115e59,color:#fff,stroke-width:2px
+classDef contention fill:#16a34a,stroke:#14532d,color:#fff,stroke-width:3px
+classDef store fill:#d97706,stroke:#92400e,color:#fff,stroke-width:2px
+classDef bottleneck fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d,stroke-width:3px
+classDef broker fill:#7c3aed,stroke:#4c1d95,color:#fff,stroke-width:2px
+classDef obs fill:#9333ea,stroke:#581c87,color:#fff,stroke-width:2px
+classDef external fill:#dc143c,stroke:#9f1239,color:#fff,stroke-width:2px
+classDef note fill:#fef9c3,stroke:#facc15,color:#713f12
+
+class CUST customer
+class CDN,LB,GW,KAFKA,OTEL broker
+class PROD,CART,SALE,PAY,CHK,ORD,SHIP,NOTIF service
+class INV contention
+class PRODDB,SALEDB,CARTDB,CHKDB,ORDDB,SHIPDB,PAYDB,NOTIFLOG,DLQ store
+class CACHE,INVDB,PROVIDER bottleneck
+class MON,LOGS,TRACE obs
+class EXT,DELIVERY external
+class NOTE1,NOTE2,NOTE3 note
+
+linkStyle 26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41 stroke:#2563eb,stroke-width:1.5px
+linkStyle 42,43,44 stroke:#dc143c,stroke-width:3px
